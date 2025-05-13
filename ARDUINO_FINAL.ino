@@ -113,9 +113,11 @@ void receiveAppKey2() {
 }
 
 bool processCard() {
-   ntag.PCD_Init();
-  unsigned long startTime = millis();
   
+  unsigned long startTime = millis();
+   while (!ntag.PICC_IsNewCardPresent() || !ntag.PICC_ReadCardSerial()) {
+    delay(50);
+  }
   // Bucle de espera activa (hasta 3 segundos)
   while (millis() - startTime < 3000) {
     if (ntag.PICC_IsNewCardPresent() && ntag.PICC_ReadCardSerial()) {
@@ -125,7 +127,7 @@ bool processCard() {
     }
     delay(100); // Pequeña pausa entre intentos
   }
-  
+  printHex(appKey2, 16);
   MFRC522_NTAG424DNA::DNA_StatusCode status = ntag.DNA_Plain_ISOSelectFile_Application();
   if (status != MFRC522_NTAG424DNA::DNA_STATUS_OK) {
     Serial.print("SelectFile ERROR: ");
@@ -220,18 +222,38 @@ void readAndSendUid() {
 
 // Funciones auxiliares modificadas
 void extractAppKey2FromBuffer() {
-  String bufferStr = String(serialBuffer);
-  int keyStart = bufferStr.indexOf("APPKEY2:");
-  if (keyStart == -1) {
-    Serial.println("[ERROR] Cabecera APPKEY2 no encontrada");
+  // Convertimos serialBuffer en String para buscar APPKEY2:
+  String buf = String(serialBuffer);
+  int p = buf.indexOf("APPKEY2:");
+  if (p < 0) {
+    Serial.println("[ERROR] APPKEY2 no encontrada");
     return;
   }
-  
-  String hexStr = bufferStr.substring(keyStart + 8, keyStart + 8 + 32);
-  hexStringToBytes(hexStr, appKey2, 16);
-  
-  Serial.print("APPKEY2 recibida: ");
-  printHex(appKey2, 16);
+
+  // A partir de ahí esperamos EXACTAMENTE 16 caracteres:
+  String keyStr = buf.substring(p + 8, p + 8 + 16);
+  keyStr.trim();  // "1000000000000000"
+
+  if (keyStr.length() != 16) {
+    Serial.print("[ERROR] Longitud inesperada de clave: ");
+    Serial.println(keyStr.length());
+    return;
+  }
+
+  // Copiamos cada carácter ASCII a appKey2[]
+  for (uint8_t i = 0; i < 16; i++) {
+    appKey2[i] = (uint8_t)keyStr.charAt(i);
+  }
+
+  // Debug: mostrar la clave en hex y ASCII
+  Serial.print("APPKEY2 ASCII: ");
+  Serial.println(keyStr);
+  Serial.print("APPKEY2 binaria(hex): ");
+  for (uint8_t i = 0; i < 16; i++) {
+    if (appKey2[i] < 0x10) Serial.print('0');
+    Serial.print(appKey2[i], HEX);
+    Serial.print(' ');
+  }
   Serial.println();
 }
 
