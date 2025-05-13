@@ -3,309 +3,203 @@
 #include <SoftwareSerial.h>
 
 SoftwareSerial espSerial(3, 2); // RX, TX
-const unsigned long BAUDRATE = 115200;
-
-// Buffer lineal
 #define BUFFER_SIZE 128
 char serialBuffer[BUFFER_SIZE];
 uint8_t bufferIndex = 0;
 
-#define SS_PIN 10
-#define RST_PIN 9
+#define SS_PIN  10
+#define RST_PIN  9
 
 MFRC522_NTAG424DNA ntag(SS_PIN, RST_PIN);
 bool deselectAndWakeupA = false;
-unsigned long timeoutState;
-unsigned long lastStateChange = 0;
 
-enum State { 
-  WAIT_CARD, 
-  REQ_APPKEY2, 
-  WAIT_APPKEY2, 
-  READ_CARDID,
-  SEND_CARDID, 
-  WAIT_APPKEY0, 
-  READ_UID 
-};
-
+enum State { WAIT_CARD, REQ_APPKEY2, WAIT_APPKEY2, READ_CARDID, SEND_CARDID, WAIT_APPKEY0, READ_UID };
 State currentState = WAIT_CARD;
 
-byte appKey2[16] = {0};
-byte appKey0[16] = {0};
-byte cardId[128];
-byte cardIdLength = 0;
-byte uid[7];
+byte appKey2[16], appKey0[16];
+byte cardId[128]; uint16_t cardIdLength;
+byte uidBuf[7];
 
-void generateRndA(byte *backRndA);
-void printHex(byte *buffer, uint16_t bufferSize);
-void resetSystem();
-String statusCodeToString(MFRC522_NTAG424DNA::DNA_StatusCode status);
+// Guardamos el rndA para el segundo paso de EV2
+byte lastRndA[16];
 
 void setup() {
   Serial.begin(9600);
   espSerial.begin(9600);
   SPI.begin();
   ntag.PCD_Init();
- // ntag.PCD_SetCRCPadSettings(0x01);
   randomSeed(analogRead(0));
   Serial.println("[SISTEMA] Inicialización completada");
 }
 
 void loop() {
-  switch(currentState) {
-    case WAIT_CARD:        handleCardDetection(); lastStateChange = millis();  break;
-    case REQ_APPKEY2:      requestAppKey2(); break;
-    case WAIT_APPKEY2:     receiveAppKey2(); break;
-    case READ_CARDID:      readCardData(); break;
-    case SEND_CARDID:      sendCardId(); break;
-    case WAIT_APPKEY0:     receiveAppKey0(); break;
-    case READ_UID:         readAndSendUid(); break;
+  switch (currentState) {
+    case WAIT_CARD:    handleCardDetection();  break;
+    case REQ_APPKEY2:  requestAppKey2();       break;
+    case WAIT_APPKEY2: receiveAppKey2();       break;
+    case READ_CARDID:  readCardData();         break;
+    case SEND_CARDID:  sendCardId();           break;
+    case WAIT_APPKEY0: receiveAppKey0();       break;
+    case READ_UID:     readAndSendUid();       break;
   }
 }
 
+// 1) Detección UID
 void handleCardDetection() {
   if (!ntag.PICC_IsNewCardPresent() || !ntag.PICC_ReadCardSerial()) return;
-  
-  Serial.println("[TARJETA] Detección exitosa - Iniciando proceso");
+  memcpy(uidBuf, ntag.uid.uidByte, ntag.uid.size);
+  Serial.print("[TARJETA] UID: "); printHex(uidBuf, ntag.uid.size); Serial.println();
   currentState = REQ_APPKEY2;
 }
 
+// 2) Pedir AppKey2
 void requestAppKey2() {
-  espSerial.flush();
+  memset(serialBuffer,0,BUFFER_SIZE);
+  bufferIndex=0;
   while(espSerial.available()) espSerial.read();
-  espSerial.println("GET_APPKEY2"); 
-  timeoutState = millis();
+  espSerial.println("GET_APPKEY2");
+  Serial.println("[UART] GET_APPKEY2 enviado");
   currentState = WAIT_APPKEY2;
-  Serial.println("[UART] Solicitud enviada. Esperando respuesta...");
 }
 
+// 3) Recibir AppKey2 (32 hex → 16 bytes)
 void receiveAppKey2() {
-  bufferIndex = 0;
-  memset(serialBuffer, 0, BUFFER_SIZE);
-  unsigned long startTime = millis();
-  
-  while(millis() - startTime < 10000) { // Timeout 10 segundos
-    if(espSerial.available()) {
+  unsigned long t0 = millis();
+  while (millis()-t0<5000) {
+    if (espSerial.available()) {
       char c = espSerial.read();
-      
-      if(bufferIndex >= BUFFER_SIZE-1) { // Prevenir overflow
-        Serial.println("[ERROR] Buffer overflow");
-        resetBuffer();
-        currentState = WAIT_CARD;
-        return;
-      }
-      
-      serialBuffer[bufferIndex++] = c;
-      
-      if(c == '\n') { // Fin de mensaje
-        printRawDebug();
-        extractAppKey2FromBuffer();
-        resetBuffer();
+      if (bufferIndex<BUFFER_SIZE-1) serialBuffer[bufferIndex++] = c;
+      if (c=='\n') {
+        String s = String(serialBuffer);
+        int p = s.indexOf("APPKEY2:");
+        if (p<0) { Serial.println("[ERROR] APPKEY2 no encontrada"); currentState=WAIT_CARD; return; }
+        String h = s.substring(p+8, p+8+32);
+        for (uint8_t i=0;i<16;i++)
+          appKey2[i] = strtoul(h.substring(2*i,2*i+2).c_str(), NULL, 16);
+        Serial.print("AppKey2: "); printHex(appKey2,16); Serial.println();
         currentState = READ_CARDID;
         return;
       }
     }
   }
-  
-  Serial.println("[ERROR] Timeout esperando APPKEY2");
-  resetBuffer();
+  Serial.println("[ERROR] Timeout APPKEY2");  
   currentState = WAIT_CARD;
 }
 
-bool processCard() {
-  
-  unsigned long startTime = millis();
-   while (!ntag.PICC_IsNewCardPresent() || !ntag.PICC_ReadCardSerial()) {
-    delay(50);
-  }
-  // Bucle de espera activa (hasta 3 segundos)
-  while (millis() - startTime < 3000) {
-    if (ntag.PICC_IsNewCardPresent() && ntag.PICC_ReadCardSerial()) {
-      Serial.print("UID Detectado: ");
-      printHex(ntag.uid.uidByte, ntag.uid.size);
-      Serial.println();
-    }
-    delay(100); // Pequeña pausa entre intentos
-  }
-  printHex(appKey2, 16);
-  MFRC522_NTAG424DNA::DNA_StatusCode status = ntag.DNA_Plain_ISOSelectFile_Application();
-  if (status != MFRC522_NTAG424DNA::DNA_STATUS_OK) {
-    Serial.print("SelectFile ERROR: ");
-    Serial.println(statusCodeToString(status));
-    return false;
-  }
-
-  byte rndA[16];
-  generateRndA(rndA);
-  status = ntag.DNA_AuthenticateEV2First(2, appKey2, rndA);
-  if (status != MFRC522_NTAG424DNA::DNA_STATUS_OK) {
-    Serial.print("Auth ERROR: ");
-    Serial.println(statusCodeToString(status));
-    return false;
-  }
-
-  byte* backData = new byte[128];
-  uint16_t backLen = 128;
-  status = ntag.DNA_Full_ReadData(
-    MFRC522_NTAG424DNA::DNA_FILE_PROPRIETARY,
-    128,
-    0,
-    backData,
-    &backLen
-  );
-  
-  if (status == MFRC522_NTAG424DNA::DNA_STATUS_OK) {
-    memcpy(cardId, backData, backLen);
-    cardIdLength = backLen;
-  }
-  
-  delete[] backData;
-  return (status == MFRC522_NTAG424DNA::DNA_STATUS_OK);
-}
-
+// 4) Selección + EV2First + EV2NonFirst + Read
 void readCardData() {
-  if (processCard()) {
-    currentState = SEND_CARDID;
-  } else {
-    Serial.println("Error");
-    currentState = WAIT_CARD;
+  // recarga UID
+  while (!ntag.PICC_IsNewCardPresent() || !ntag.PICC_ReadCardSerial()) {
+    Serial.println("[ERROR] Tarjeta no presente");
+    delay(1000);
   }
+
+  // SelectFile
+  auto st = ntag.DNA_Plain_ISOSelectFile_Application();
+  if (st!=MFRC522_NTAG424DNA::DNA_STATUS_OK) {
+    Serial.print("[ERROR] SelectFile: "); Serial.println(statusToStr(st));
+    currentState = WAIT_CARD; return;
+  }
+  Serial.println("[OK] SelectFile");
+
+  // AuthenticateEV2First
+  generateRndA(lastRndA);
+  st = ntag.DNA_AuthenticateEV2First(2, appKey2, lastRndA);
+  if (st!=MFRC522_NTAG424DNA::DNA_STATUS_OK) {
+    Serial.print("[ERROR] AuthFirst: "); Serial.println(statusToStr(st));
+    currentState = WAIT_CARD; return;
+  }
+  Serial.println("[OK] AuthFirst");
+
+  // AuthenticateEV2NonFirst
+  st = ntag.DNA_AuthenticateEV2NonFirst(2, appKey2, lastRndA);
+  if (st!=MFRC522_NTAG424DNA::DNA_STATUS_OK) {
+    Serial.print("[ERROR] AuthNonFirst: "); Serial.println(statusToStr(st));
+    currentState = WAIT_CARD; return;
+  }
+  Serial.println("[OK] AuthComplete");
+
+  // Leer propietario
+  uint16_t len=128;
+  byte* buf = new byte[len];
+  st = ntag.DNA_Full_ReadData(MFRC522_NTAG424DNA::DNA_FILE_PROPRIETARY,128,0,buf,&len);
+  if (st!=MFRC522_NTAG424DNA::DNA_STATUS_OK) {
+    Serial.print("[ERROR] ReadData: "); Serial.println(statusToStr(st));
+    delete[] buf; currentState=WAIT_CARD; return;
+  }
+  memcpy(cardId,buf,len);
+  cardIdLength=len;
+  delete[] buf;
+  Serial.print("[OK] ReadData bytes="); Serial.println(cardIdLength);
+
+  currentState = SEND_CARDID;
 }
 
+// 5) Enviar CardID
 void sendCardId() {
   espSerial.print("CARDID:");
-  for (uint16_t i = 0; i < cardIdLength; i++) {
-    if (cardId[i] < 0x10) espSerial.print("0");
-    espSerial.print(cardId[i], HEX);
+  for (uint16_t i=0;i<cardIdLength;i++){
+    if (cardId[i]<0x10) espSerial.print('0');
+    espSerial.print(cardId[i],HEX);
   }
   espSerial.println();
   currentState = WAIT_APPKEY0;
 }
 
+// 6) Recibir AppKey0
 void receiveAppKey0() {
-  if (espSerial.available()) {
-    String response = espSerial.readStringUntil('\n');
-    if (response.startsWith("APPKEY0:")) {
-      hexStringToBytes(response.substring(8), appKey0, 16);
-      authenticateAppKey0();
-    }
-  }
+  if (!espSerial.available()) return;
+  String s = espSerial.readStringUntil('\n');
+  if (!s.startsWith("APPKEY0:")) return;
+  String h = s.substring(8);
+  for (uint8_t i=0;i<16;i++)
+    appKey0[i] = strtoul(h.substring(2*i,2*i+2).c_str(),NULL,16);
+  Serial.print("AppKey0: "); printHex(appKey0,16); Serial.println();
+  // luego podrías autenticar con key0...
+  currentState = READ_UID;
 }
 
-void authenticateAppKey0() {
-  MFRC522_NTAG424DNA::DNA_StatusCode status = ntag.DNA_Plain_ISOSelectFile_Application();
-  if (status != MFRC522_NTAG424DNA::DNA_STATUS_OK) return;
-
-  byte rndA[16];
-  generateRndA(rndA);
-  status = ntag.DNA_AuthenticateEV2First(0, appKey0, rndA);
-  
-  if (status == MFRC522_NTAG424DNA::DNA_STATUS_OK) {
-    currentState = READ_UID;
-  } else {
-    resetSystem();
-  }
-}
-
+// 7) Leer y enviar UID
 void readAndSendUid() {
-  MFRC522_NTAG424DNA::DNA_StatusCode status = ntag.DNA_Full_GetCardUID(uid);
-  if (status == MFRC522_NTAG424DNA::DNA_STATUS_OK) {
+  byte out[7]; MFRC522_NTAG424DNA::DNA_StatusCode st;
+  uint16_t ulen=7;
+  st = ntag.DNA_Full_GetCardUID(out);
+  if (st==MFRC522_NTAG424DNA::DNA_STATUS_OK) {
     espSerial.print("UID:");
-    for (uint16_t i = 0; i < 7; i++) {
-      if (uid[i] < 0x10) espSerial.print("0");
-      espSerial.print(uid[i], HEX);
+    for (uint8_t i=0;i<ulen;i++){
+      if (out[i]<0x10) espSerial.print('0');
+      espSerial.print(out[i],HEX);
     }
     espSerial.println();
   }
   resetSystem();
 }
 
-// Funciones auxiliares modificadas
-void extractAppKey2FromBuffer() {
-  // Convertimos serialBuffer en String para buscar APPKEY2:
-  String buf = String(serialBuffer);
-  int p = buf.indexOf("APPKEY2:");
-  if (p < 0) {
-    Serial.println("[ERROR] APPKEY2 no encontrada");
-    return;
-  }
-
-  // A partir de ahí esperamos EXACTAMENTE 16 caracteres:
-  String keyStr = buf.substring(p + 8, p + 8 + 16);
-  keyStr.trim();  // "1000000000000000"
-
-  if (keyStr.length() != 16) {
-    Serial.print("[ERROR] Longitud inesperada de clave: ");
-    Serial.println(keyStr.length());
-    return;
-  }
-
-  // Copiamos cada carácter ASCII a appKey2[]
-  for (uint8_t i = 0; i < 16; i++) {
-    appKey2[i] = (uint8_t)keyStr.charAt(i);
-  }
-
-  // Debug: mostrar la clave en hex y ASCII
-  Serial.print("APPKEY2 ASCII: ");
-  Serial.println(keyStr);
-  Serial.print("APPKEY2 binaria(hex): ");
-  for (uint8_t i = 0; i < 16; i++) {
-    if (appKey2[i] < 0x10) Serial.print('0');
-    Serial.print(appKey2[i], HEX);
-    Serial.print(' ');
-  }
-  Serial.println();
-}
-
-void printRawDebug() {
-  Serial.print("[UART] Raw: ");
-  for(uint8_t i = 0; i < bufferIndex; i++) {
-    if(serialBuffer[i] < 0x10) Serial.print("0");
-    Serial.print(serialBuffer[i], HEX);
-    Serial.print(" ");
-  }
-  Serial.println();
-}
-
-void resetBuffer() {
-  memset(serialBuffer, 0, BUFFER_SIZE);
-  bufferIndex = 0;
-}
-
-void hexStringToBytes(String hex, byte* buffer, int length) {
-  for (int i = 0; i < length; i++) {
-    buffer[i] = strtoul(hex.substring(i*2, i*2+2).c_str(), NULL, 16);
-  }
-}
-
+//-----------------------------------------------------------------------------
+// Helpers
+//-----------------------------------------------------------------------------
 void resetSystem() {
   ntag.PICC_HaltA();
   ntag.PCD_StopCrypto1();
-  ntag.PCD_Init();
   currentState = WAIT_CARD;
-  memset(appKey2, 0, sizeof(appKey2));
-  memset(appKey0, 0, sizeof(appKey0));
-  espSerial.flush();
-  while(espSerial.available()) espSerial.read();
   Serial.println("[SISTEMA] Reiniciado");
 }
 
-String statusCodeToString(MFRC522_NTAG424DNA::DNA_StatusCode status) {
-  switch(status) {
-    case 0x00: return "OK";
-    case 0x0A: return "Auth Failed";
-    case 0x0F: return "Timeout";
-    default: return "Error 0x" + String(status, HEX);
+void generateRndA(byte *r) {
+  for (uint8_t i=0;i<16;i++) r[i]=random(0xFF);
+}
+
+void printHex(byte *b,uint16_t l) {
+  for(uint16_t i=0;i<l;i++){
+    if(b[i]<0x10) Serial.print('0');
+    Serial.print(b[i],HEX);
+    Serial.print(' ');
   }
 }
 
-void generateRndA(byte *backRndA) {
-  for (byte i = 0; i < 16; i++) backRndA[i] = random(0xFF);
-}
-
-void printHex(byte *buffer, uint16_t bufferSize) {
-  for (uint16_t i = 0; i < bufferSize; i++) {
-    if(buffer[i] < 0x10) Serial.print("0");
-    Serial.print(buffer[i], HEX);
-  }
+String statusToStr(MFRC522_NTAG424DNA::DNA_StatusCode s) {
+  if (s == MFRC522_NTAG424DNA::DNA_STATUS_OK)      return "OK";
+  if (s == MFRC522_NTAG424DNA::DNA_STATUS_TIMEOUT) return "Timeout";
+  // otros estados según tu versión de la librería...
+  return "Err0x"+String((uint8_t)s,HEX);
 }
