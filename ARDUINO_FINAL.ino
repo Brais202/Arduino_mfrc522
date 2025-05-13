@@ -110,61 +110,94 @@ void receiveAppKey2() {
   resetBuffer();
   currentState = WAIT_CARD;
 }
-
 void readCardData() {
-
   MFRC522_NTAG424DNA::DNA_StatusCode status;
-  
-  status = ntag.DNA_Plain_ISOSelectFile_Application();
-  if (status != MFRC522_NTAG424DNA::DNA_STATUS_OK) {
-    Serial.print("[ERROR] Selección aplicación: ");
-    Serial.println(statusCodeToString(status));
-    handleError(status);
-    return;
+  static byte globalRetries = 0;
+  const byte MAX_GLOBAL_RETRIES = 3;
+  const uint16_t READ_RETRY_DELAY = 1000;
+
+  // Reset inicial del hardware
+  if(globalRetries == 0) {
+    resetReaderHardware();
+    if (!ntag.PICC_IsNewCardPresent() || !ntag.PICC_ReadCardSerial()) {
+       return;
+      }
   }
 
+  // Paso 1: Selección de aplicación
+  status = ntag.DNA_Plain_ISOSelectFile_Application();
+  if(status != MFRC522_NTAG424DNA::DNA_STATUS_OK) {
+    handleRetry("[SELEC] Fallo selección", globalRetries, MAX_GLOBAL_RETRIES);
+    return;
+  }
+  Serial.println("Selección correcta");
+  // Paso 2: Autenticación
   byte rndA[16];
   generateRndA(rndA);
-  Serial.print("[RNDA] ");
-  printHex(rndA, 16);
-  Serial.println();
-
   status = ntag.DNA_AuthenticateEV2First(2, appKey2, rndA);
-  if (status != MFRC522_NTAG424DNA::DNA_STATUS_OK) {
-    Serial.print("[ERROR] Autenticación Fallida: ");
-    Serial.println(statusCodeToString(status));
-    handleError(status);
+  if(status != MFRC522_NTAG424DNA::DNA_STATUS_OK) {
+    handleRetry("[AUTH] Fallo autenticación", globalRetries, MAX_GLOBAL_RETRIES);
     return;
   }
 
-  readProprietaryFile();
+  // Paso 3: Lectura de datos con reintentos específicos
+  uint16_t backLen = 128;
+  byte* buffer = new byte[backLen];
+  bool readSuccess = false;
+  
+  for(byte readAttempt = 0; readAttempt < 3; readAttempt++) {
+    status = ntag.DNA_Full_ReadData(
+      MFRC522_NTAG424DNA::DNA_FILE_PROPRIETARY, 
+      backLen, 
+      0, 
+      buffer, 
+      &backLen
+    );
+
+    if(status == MFRC522_NTAG424DNA::DNA_STATUS_OK) {
+      memcpy(cardId, buffer, backLen);
+      cardIdLength = backLen;
+      readSuccess = true;
+      break;
+    }
+    
+    // Reset específico para fallos de lectura
+    Serial.print("[LECT] Fallo lectura (");
+    Serial.print(readAttempt + 1);
+    Serial.println(") - Reiniciando comunicación");
+    ntag.PCD_StopCrypto1();
+    delay(READ_RETRY_DELAY);
+  }
+
+  delete[] buffer;
+
+  if(!readSuccess) {
+    handleRetry("[LECT] Fallo definitivo", globalRetries, MAX_GLOBAL_RETRIES);
+    return;
+  }
+
+  // Éxito completo
+  globalRetries = 0;
+  Serial.println("[OK] Datos leídos correctamente");
   currentState = SEND_CARDID;
 }
 
-void readProprietaryFile() {
-  uint16_t backLen = 128;
-  byte* buffer = new byte[backLen];
+void handleRetry(const char* errorMsg, byte &retryCounter, byte maxRetries) {
+  Serial.print(errorMsg);
+  Serial.print(" (Intento ");
+  Serial.print(retryCounter + 1);
+  Serial.println("/3)");
   
-  MFRC522_NTAG424DNA::DNA_StatusCode status = ntag.DNA_Full_ReadData(
-    MFRC522_NTAG424DNA::DNA_FILE_PROPRIETARY, 
-    backLen, 
-    0, 
-    buffer, 
-    &backLen
-  );
-  
-  if (status == MFRC522_NTAG424DNA::DNA_STATUS_OK) {
-    memcpy(cardId, buffer, backLen);
-    cardIdLength = backLen;
-    Serial.println("[LECTURA] Archivo propietario leído");
+  if(retryCounter < maxRetries - 1) {
+    retryCounter++;
+    resetReaderHardware();
+    delay(2000);
   } else {
-    Serial.print("[ERROR] Lectura archivo: ");
-    Serial.println(statusCodeToString(status));
+    Serial.println("[FATAL] Fallo crítico - Reiniciando sistema");
+    retryCounter = 0;
+    resetSystem();
   }
-  
-  delete[] buffer;
 }
-
 void sendCardId() {
   espSerial.print("CARDID:");
   Serial.print("[CARDID] ");
@@ -273,31 +306,6 @@ void handleError(MFRC522_NTAG424DNA::DNA_StatusCode status) {
   resetSystem();
 }
 
-void processResponse(String response) {
-  
-  // Debug: Mostrar respuesta cruda
-  Serial.print("[DEBUG] Respuesta completa: ");
-  Serial.println(response);
-  Serial.print("Longitud: ");
-  Serial.println(response.length());
-
-  // Eliminar caracteres no válidos (incluyendo retornos de carro)
-  response.replace("\r", "");
-  response.replace("\n", "");
-  response.trim();
-
-  if(response.startsWith("APPKEY2:")) {
-    String keyStr = response.substring(8);
-    if(keyStr.length() == 16) {
-      hexStringToBytes(keyStr, appKey2, 16);
-      Serial.println("[OK] Clave validada - Transición a READ_CARDID");
-      currentState = READ_CARDID;
-      return;
-    }
-  }
-  Serial.println("[ERROR] Formato de respuesta inválido");
-  resetSystem();
-}
 
 String printRawDebug() {
   String asciiString = "";
@@ -362,7 +370,7 @@ void resetSystem() {
   espSerial.flush();
   while(espSerial.available()) espSerial.read();
   
-  Serial.println("[SISTEMA] Listo para nueva tarjeta");
+  
 }
 
 void extractAppKey2FromBuffer() {
@@ -396,4 +404,11 @@ void extractAppKey2FromBuffer() {
     Serial.print(' ');
   }
   Serial.println();
+}
+
+void resetReaderHardware() {
+  ntag.PCD_Reset();
+  delay(50);
+  ntag.PCD_Init();
+  Serial.println("[HARDWARE] Reseteo completo del lector");
 }
