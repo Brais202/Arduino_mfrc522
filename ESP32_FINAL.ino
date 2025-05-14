@@ -2,8 +2,8 @@
 #include <HTTPClient.h>
 #include <Arduino.h>
 
-const char* ssid = "Brais";
-const char* password = "brais2002";
+const char* ssid = "Cooper2";
+const char* password = "Malena2011_";
 const char* serverUrl = "http://192.168.1.53:8000";
 
 #define UART_RX_PIN 27
@@ -82,7 +82,7 @@ void fetchFromServer(String endpoint, String prefix) {
     payload.replace("\"", "");
     Serial2.flush();  // Limpiar buffer de salida
     delay(10);        
-    if(payload.length() == 16) {
+    if(payload.length() == 32) {
       String mensaje = "APPKEY2:" + payload + "\n";  // \n como terminador
       Serial2.print(mensaje);
       Serial.print(mensaje);

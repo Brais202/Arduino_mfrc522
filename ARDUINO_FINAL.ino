@@ -62,37 +62,50 @@ void requestAppKey2() {
   currentState = WAIT_APPKEY2;
 }
 
-// 3) Recibir AppKey2 (32 hex → 16 bytes)
 void receiveAppKey2() {
-  unsigned long t0 = millis();
-  while (millis()-t0<5000) {
+  bufferIndex = 0;
+  memset(serialBuffer, 0, BUFFER_SIZE);
+
+  unsigned long startTime = millis();
+  const unsigned long TIMEOUT_MS = 15000;
+
+  while (millis() - startTime < TIMEOUT_MS) {
     if (espSerial.available()) {
       char c = espSerial.read();
-      if (bufferIndex<BUFFER_SIZE-1) serialBuffer[bufferIndex++] = c;
-      if (c=='\n') {
-        String s = String(serialBuffer);
-        int p = s.indexOf("APPKEY2:");
-        if (p<0) { Serial.println("[ERROR] APPKEY2 no encontrada"); currentState=WAIT_CARD; return; }
-        String h = s.substring(p+8, p+8+32);
-        for (uint8_t i=0;i<16;i++)
-          appKey2[i] = strtoul(h.substring(2*i,2*i+2).c_str(), NULL, 16);
-        Serial.print("AppKey2: "); printHex(appKey2,16); Serial.println();
+      if (bufferIndex < BUFFER_SIZE - 1) {
+        serialBuffer[bufferIndex++] = c;
+      }
+      if (c == '\n') {
+        // debug UART
+        printRawDebug();
+
+        // extrae la clave
+        extractAppKey2FromBuffer();
+
+        resetBuffer();
         currentState = READ_CARDID;
         return;
       }
     }
+    delay(50);
   }
-  Serial.println("[ERROR] Timeout APPKEY2");  
+
+  Serial.println("[ERROR] Timeout esperando APPKEY2");
+  resetBuffer();
   currentState = WAIT_CARD;
 }
+
 
 // 4) Selección + EV2First + EV2NonFirst + Read
 void readCardData() {
   // recarga UID
-  while (!ntag.PICC_IsNewCardPresent() || !ntag.PICC_ReadCardSerial()) {
-    Serial.println("[ERROR] Tarjeta no presente");
-    delay(1000);
-  }
+ /* if (!ntag.PICC_TryDeselectAndWakeupA()) {
+    // Si no pudimos despertar la tarjeta, leemos de nuevo:
+    while (!ntag.PICC_IsNewCardPresent() || !ntag.PICC_ReadCardSerial()) {
+      Serial.println("[ERROR] Tarjeta no presente (wake failed)");
+      delay(1000);
+    }
+  }*/
 
   // SelectFile
   auto st = ntag.DNA_Plain_ISOSelectFile_Application();
@@ -189,17 +202,78 @@ void generateRndA(byte *r) {
   for (uint8_t i=0;i<16;i++) r[i]=random(0xFF);
 }
 
-void printHex(byte *b,uint16_t l) {
-  for(uint16_t i=0;i<l;i++){
-    if(b[i]<0x10) Serial.print('0');
-    Serial.print(b[i],HEX);
+void printHex(const byte *b, uint16_t len) {
+  for (uint16_t i = 0; i < len; i++) {
+    if (b[i] < 0x10) Serial.print('0');
+    Serial.print(b[i], HEX);
     Serial.print(' ');
   }
 }
+
 
 String statusToStr(MFRC522_NTAG424DNA::DNA_StatusCode s) {
   if (s == MFRC522_NTAG424DNA::DNA_STATUS_OK)      return "OK";
   if (s == MFRC522_NTAG424DNA::DNA_STATUS_TIMEOUT) return "Timeout";
   // otros estados según tu versión de la librería...
   return "Err0x"+String((uint8_t)s,HEX);
+}
+void extractAppKey2FromBuffer() {
+  // Asegúrate de que serialBuffer está NUL-terminated en bufferIndex
+  serialBuffer[bufferIndex] = '\0';
+
+  // Busca la cabecera con strstr (devuelve puntero al primer match o nullptr)
+  char *p = strstr(serialBuffer, "APPKEY2:");
+  if (!p) {
+    Serial.println("[ERROR] Cabecera APPKEY2 no encontrada");
+    return;
+  }
+
+  // Avanza 8 caracteres para situarte justo después de "APPKEY2:"
+  p += 8;
+
+  // Ahora p apunta al primer dígito hex. Deben venir 32 caracteres para 16 bytes.
+  // Comprueba longitud suficiente:
+  size_t remaining = strlen(p);
+  if (remaining < 32) {
+    Serial.print("[ERROR] No hay suficientes dígitos hex (esperaba 32, hay ");
+    Serial.print(remaining);
+    Serial.println(")");
+    return;
+  }
+
+  // Convierte cada par de hex a un byte
+  for (uint8_t i = 0; i < 16; ++i) {
+    char byteHex[3] = { p[2*i], p[2*i + 1], '\0' };
+    appKey2[i] = (byte) strtoul(byteHex, nullptr, 16);
+  }
+
+  // Debug final
+  Serial.print("APPKEY2 binaria (16 bytes): ");
+  printHex(appKey2, 16);
+  Serial.println();
+}
+
+
+
+
+void printRawDebug() {
+  Serial.print("[UART] Raw HEX: ");
+  for (uint8_t i = 0; i < bufferIndex; i++) {
+    uint8_t b = serialBuffer[i];
+    Serial.print(b < 0x10 ? "0" : "");
+    Serial.print(b, HEX);
+    Serial.print(" ");
+  }
+  Serial.println();
+}
+
+
+void hexStringToBytes(String hex, byte* buffer, int length) {
+  for (int i = 0; i < length; i++) {
+    buffer[i] = strtoul(hex.substring(i*2, i*2+2).c_str(), NULL, 16);
+  }
+}
+void resetBuffer() {
+  memset(serialBuffer, 0, BUFFER_SIZE);
+  bufferIndex = 0;
 }
