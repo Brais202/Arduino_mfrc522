@@ -24,7 +24,7 @@ byte uidBuf[7];
 byte lastRndA[16];
 
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200);
   espSerial.begin(9600);
   SPI.begin();
   ntag.PCD_Init();
@@ -94,89 +94,87 @@ void receiveAppKey2() {
   resetBuffer();
   currentState = WAIT_CARD;
 }
-
+// --------------------------------------------------------
+// Paso 4) Selección + EV2First + EV2NonFirst + Read
+// --------------------------------------------------------
 // --------------------------------------------------------
 // Paso 4) Selección + EV2First + EV2NonFirst + Read
 // --------------------------------------------------------
 void readCardData() {
-  // Si teníamos un deselectAndWakeupA pendiente, intentamos despertarla:
- /* static bool deselectAndWakeupA = false;
-  if (deselectAndWakeupA) {
-    deselectAndWakeupA = false;
-    if (!ntag.PICC_TryDeselectAndWakeupA()) {
-      Serial.println("[WARN] Wake-up fallido, reintentando detección normal");
-      return;  // volvemos al loop principal para re-detectar
-    }
-  }*/
-  // 1) Bucle de detección nuevo acercamiento
-  if (!ntag.PICC_IsNewCardPresent() || !ntag.PICC_ReadCardSerial()) {
+  // 1) Detectamos tarjeta
+  if (!ntag.PICC_IsNewCardPresent() || !ntag.PICC_ReadCardSerial()) return;
+
+  // 2) Seleccionar aplicación NTAG424
+  auto status = ntag.DNA_Plain_ISOSelectFile_Application();
+  if (status != MFRC522_NTAG424DNA::DNA_STATUS_OK) {
+    Serial.print(F("[ERROR] SelectFile  : 0x"));
+    Serial.println((uint8_t)status, HEX);
     return;
   }
+  Serial.println(F("[OK]   SelectFile"));
+  delay(50);
 
-  // 2) SELECT FILE (aplicación NTAG424)
-  auto st = ntag.DNA_Plain_ISOSelectFile_Application();
-  if (st != MFRC522_NTAG424DNA::DNA_STATUS_OK) {
-    Serial.print("[ERROR] SelectFile  : 0x");
-    Serial.println((uint8_t)st, HEX);
-    // si no es un timeout, flag para wake-up next
-    if (st != MFRC522_NTAG424DNA::DNA_STATUS_TIMEOUT) deselectAndWakeupA = true;
-    return;
-  }
-  Serial.println("[OK]   SelectFile");
-
-  byte authKey[16] = {0x01, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00};
-  // 3) AUTHENTICATE EV2 FIRST (Key2)
+  // 3) Authenticate EV2 First con clave fija de prueba
+  byte authKey[16] = {
+    0x01,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00
+  };
   byte rndA[16];
-  for (byte i = 0; i < 16; i++) rndA[i] = random(0xFF);
-  st = ntag.DNA_AuthenticateEV2First(2, authKey, rndA);
-  if (st != MFRC522_NTAG424DNA::DNA_STATUS_OK) {
-    Serial.print("[ERROR] AuthFirst : 0x");
-    Serial.println((uint8_t)st, HEX);
-    if (st != MFRC522_NTAG424DNA::DNA_STATUS_TIMEOUT) deselectAndWakeupA = true;
-    return;
-  }
-  Serial.println("[OK]   AuthFirst");
+  generateRndA(rndA);
 
-  // 4) AUTHENTICATE EV2 NON-FIRST (completar handshake)
-  st = ntag.DNA_AuthenticateEV2NonFirst(2, appKey2, rndA);
-  if (st != MFRC522_NTAG424DNA::DNA_STATUS_OK) {
-    Serial.print("[ERROR] AuthNon1st: 0x");
-    Serial.println((uint8_t)st, HEX);
-    ntag.PICC_HaltA();
+  status = ntag.DNA_AuthenticateEV2First(2, authKey, rndA);
+  if (status != MFRC522_NTAG424DNA::DNA_STATUS_OK) {
+    Serial.print(F("[ERROR] AuthFirst : 0x"));
+    Serial.println((uint8_t)status, HEX);
     return;
   }
-  Serial.println("[OK]   AuthComplete");
+  Serial.println(F("[OK]   AuthFirst"));
+  delay(50);
 
-  // 5) FULL READ DATA en un solo bloque (128 bytes suele caber):
-  uint16_t backLen = 128;
-  byte* backData = (byte*)malloc(backLen);
-  if (!backData) {
-    Serial.println("[FATAL] malloc failed");
+  // 4) Authenticate EV2 Non‑First — **¡misma clave y mismo rndA!**
+  status = ntag.DNA_AuthenticateEV2NonFirst(2, authKey, rndA);
+  if (status != MFRC522_NTAG424DNA::DNA_STATUS_OK) {
+    Serial.print(F("[ERROR] AuthNon1st: 0x"));
+    Serial.println((uint8_t)status, HEX);
     return;
   }
-  st = ntag.DNA_Full_ReadData(
+  Serial.println(F("[OK]   AuthComplete"));
+  delay(50);
+
+  // 5) Full Read Data (archivo propietario)
+  const uint16_t TO_READ = 128;
+  byte  buffer[TO_READ];
+  uint16_t backLen = TO_READ;
+  status = ntag.DNA_Full_ReadData(
     MFRC522_NTAG424DNA::DNA_FILE_PROPRIETARY,
-    backLen, 0, backData, &backLen
+    TO_READ,
+    0,
+    buffer,
+    &backLen
   );
-  if (st != MFRC522_NTAG424DNA::DNA_STATUS_OK) {
-    Serial.print("[ERROR] ReadData   : 0x");
-    Serial.println((uint8_t)st, HEX);
-    free(backData);
-    ntag.PICC_HaltA();
-    return;
-  }
-  Serial.print("[OK]   File bytes = ");
-  Serial.println(backLen);
-  Serial.write(backData, backLen);
-  Serial.println();
-  free(backData);
 
-  // 6) Fin de este ciclo
+  if (status != MFRC522_NTAG424DNA::DNA_STATUS_OK) {
+    Serial.print(F("[ERROR] ReadData   : 0x"));
+    Serial.println((uint8_t)status, HEX);
+  } else {
+    Serial.print(F("[OK]   File bytes = "));
+    Serial.println(backLen);
+    for (uint16_t i = 0; i < backLen; ++i) {
+      if (buffer[i] < 0x10) Serial.print('0');
+      Serial.print(buffer[i], HEX);
+      Serial.print(' ');
+    }
+    Serial.println();
+  }
+
+  // 6) Finalizamos la sesión
   ntag.PICC_HaltA();
+  currentState = SEND_CARDID;
 }
+
+
 
 
 
