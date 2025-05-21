@@ -256,14 +256,14 @@ void readAndSendUid() {
   
   // 4) Authenticate EV2 First con Key0 
   byte keyNumber = 0;
-  byte authKey[16] = { 0x62, 0xD5, 0xEA, 0xF0,
+  /*byte authKey[16] = { 0x62, 0xD5, 0xEA, 0xF0,
   0xD2, 0x74, 0xF1, 0xF4,
   0x39, 0x6A, 0xB4, 0x2B,
-  0xC9, 0xF0, 0x3C, 0xBC };      
+  0xC9, 0xF0, 0x3C, 0xBC };   */   
   byte rndA[16];
   generateRndA(rndA);
 
-  st = ntag.DNA_AuthenticateEV2First(keyNumber, authKey, rndA);
+  st = ntag.DNA_AuthenticateEV2First(keyNumber, appKey0, rndA);
   if (st != MFRC522_NTAG424DNA::DNA_STATUS_OK) {
     Serial.print(F("AuthenticateEV2First STATUS NOT OK: "));
     Serial.println(st);
@@ -272,7 +272,7 @@ void readAndSendUid() {
   }
 
   // 5) Authenticate EV2 Non‑First (completar handshake con misma key0 y rndA)
-  st = ntag.DNA_AuthenticateEV2NonFirst(keyNumber, authKey, rndA);
+  st = ntag.DNA_AuthenticateEV2NonFirst(keyNumber, appKey0, rndA);
   if (st != MFRC522_NTAG424DNA::DNA_STATUS_OK) {
     Serial.print(F("AuthenticateEV2NonFirst STATUS NOT OK: "));
     Serial.println(st);
